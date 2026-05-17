@@ -3338,6 +3338,457 @@ async function performOAuthLogin(
 	return result ?? false;
 }
 
+// ==========================================================================
+// Antigravity request transformation (Phase 7a+7b)
+// Hooks into before_provider_request for payload sanitization,
+// Claude tool normalization, and thought signature injection.
+// ==========================================================================
+
+const ANTIGRAVITY_PROVIDER_PREFIXES = ["google-antigravity", "google-gemini-cli"];
+const CLAUDE_MODEL_PATTERNS = [/claude/i];
+const CLAUDE_THINKING_PATTERNS = [/claude.*thinking/i, /claude.*opus.*thinking/i];
+
+function isAntigravityProvider(provider: string | undefined): boolean {
+	if (!provider) return false;
+	return ANTIGRAVITY_PROVIDER_PREFIXES.some((prefix) => provider.startsWith(prefix));
+}
+
+function isClaudeModel(modelId: string | undefined): boolean {
+	if (!modelId) return false;
+	return CLAUDE_MODEL_PATTERNS.some((pattern) => pattern.test(modelId));
+}
+
+function isClaudeThinkingModel(modelId: string | undefined): boolean {
+	if (!modelId) return false;
+	return CLAUDE_THINKING_PATTERNS.some((pattern) => pattern.test(modelId));
+}
+
+// ------------------------------------------------------------------------
+// Phase 7a: Request payload sanitization
+// ------------------------------------------------------------------------
+
+interface ContentPart {
+	text?: string | { text?: string };
+	functionCall?: unknown;
+	functionResponse?: unknown;
+	inlineData?: unknown;
+	fileData?: unknown;
+	executableCode?: unknown;
+	codeExecutionResult?: unknown;
+	thought?: boolean;
+	type?: string;
+	[key: string]: unknown;
+}
+
+interface ContentBlock {
+	role?: string;
+	parts?: ContentPart[];
+	content?: ContentPart[];
+	[key: string]: unknown;
+}
+
+interface AntigravityRequestPayload {
+	contents?: ContentBlock[];
+	messages?: ContentBlock[];
+	systemInstruction?: ContentBlock | string;
+	system_instruction?: ContentBlock | string;
+	tools?: unknown[];
+	toolConfig?: Record<string, unknown>;
+	generationConfig?: Record<string, unknown>;
+	[key: string]: unknown;
+}
+
+function isValidContentPart(part: ContentPart): boolean {
+	if (!part || typeof part !== "object") return false;
+	const keys = Object.keys(part);
+	return keys.some((k) => k !== "thoughtSignature" && k !== "thought_signature" && k !== "signature" && part[k] !== undefined);
+}
+
+function sanitizeContentParts(parts: ContentPart[] | undefined): ContentPart[] | undefined {
+	if (!parts) return undefined;
+	const filtered = parts.filter(isValidContentPart);
+	return filtered.length > 0 ? filtered : undefined;
+}
+
+function sanitizeAntigravityPayload(payload: unknown, _modelId?: string): unknown {
+	if (!payload || typeof payload !== "object") return payload;
+	const p = payload as AntigravityRequestPayload;
+
+	// Sanitize contents
+	if (Array.isArray(p.contents)) {
+		p.contents = (p.contents
+			.map((block) => {
+				if (!block || typeof block !== "object") return undefined;
+				const sanitizedParts = sanitizeContentParts((block as ContentBlock).parts);
+				if (!sanitizedParts) return undefined;
+				return { ...(block as ContentBlock), parts: sanitizedParts };
+			})
+			.filter((block): block is NonNullable<typeof block> => block !== undefined)) as ContentBlock[];
+	}
+
+	// Sanitize messages (Claude format)
+	if (Array.isArray(p.messages)) {
+		p.messages = (p.messages
+			.map((msg) => {
+				if (!msg || typeof msg !== "object") return undefined;
+				const sanitizedContent = sanitizeContentParts((msg as ContentBlock).content);
+				if (!sanitizedContent) return undefined;
+				return { ...(msg as ContentBlock), content: sanitizedContent };
+			})
+			.filter((msg): msg is NonNullable<typeof msg> => msg !== undefined)) as ContentBlock[];
+	}
+
+	// Sanitize system instruction
+	const sysInst = p.systemInstruction ?? p.system_instruction;
+	if (sysInst && typeof sysInst === "object" && !Array.isArray(sysInst)) {
+		const sys = sysInst as ContentBlock;
+		const sanitizedParts = sanitizeContentParts(sys.parts);
+		if (sanitizedParts) {
+			p.systemInstruction = { ...sys, parts: sanitizedParts };
+			delete p.system_instruction;
+		} else {
+			delete p.systemInstruction;
+			delete p.system_instruction;
+		}
+	}
+
+	// Strip x-goog-user-project from payload if present (belt-and-suspenders)
+	delete (p as Record<string, unknown>)["x-goog-user-project"];
+
+	return payload;
+}
+
+// ------------------------------------------------------------------------
+// Phase 7c: Claude tool schema normalization
+// ------------------------------------------------------------------------
+
+const PHASE7_EMPTY_PLACEHOLDER_NAME = "_placeholder";
+const PHASE7_EMPTY_PLACEHOLDER_DESC = "Placeholder. Always pass true.";
+
+function cleanJSONSchemaForAntigravity(schema: unknown): Record<string, unknown> | undefined {
+	if (!schema || typeof schema !== "object" || Array.isArray(schema)) return undefined;
+	const cleaned: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+		if (key.startsWith("$") || key === "additionalProperties" || key === "definitions") continue;
+		cleaned[key] = value;
+	}
+	return cleaned;
+}
+
+function normalizeClaudeToolSchema(schema: unknown): Record<string, unknown> {
+	const createPlaceholder = (): Record<string, unknown> => ({
+		type: "object",
+		properties: { [PHASE7_EMPTY_PLACEHOLDER_NAME]: { type: "boolean", description: PHASE7_EMPTY_PLACEHOLDER_DESC } },
+		required: [PHASE7_EMPTY_PLACEHOLDER_NAME],
+	});
+
+	if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+		return createPlaceholder();
+	}
+
+	const cleaned = cleanJSONSchemaForAntigravity(schema);
+	if (!cleaned) return createPlaceholder();
+
+	cleaned.type = "object";
+
+	const props = cleaned.properties;
+	const hasProperties = props && typeof props === "object" && Object.keys(props as object).length > 0;
+	if (!hasProperties) {
+		cleaned.properties = { [PHASE7_EMPTY_PLACEHOLDER_NAME]: { type: "boolean", description: PHASE7_EMPTY_PLACEHOLDER_DESC } };
+		cleaned.required = Array.isArray(cleaned.required)
+			? [...new Set([...(cleaned.required as string[]), PHASE7_EMPTY_PLACEHOLDER_NAME])]
+			: [PHASE7_EMPTY_PLACEHOLDER_NAME];
+	}
+
+	return cleaned;
+}
+
+const CLAUDE_TOOL_HARDENING = "CRITICAL: Use ONLY the exact parameter names and structure from the tool schemas. Do not guess or substitute parameters from training data. Read schemas carefully.";
+
+function normalizeClaudeTools(payload: AntigravityRequestPayload): void {
+	if (!Array.isArray(payload.tools) || payload.tools.length === 0) return;
+
+	const functionDeclarations: Array<{ name: string; description: string; parameters: Record<string, unknown> }> = [];
+	const passthroughTools: unknown[] = [];
+
+	for (const tool of payload.tools) {
+		if (!tool || typeof tool !== "object") continue;
+		const t = tool as Record<string, unknown>;
+
+		// Handle functionDeclarations array (already Claude format)
+		if (Array.isArray(t.functionDeclarations) && t.functionDeclarations.length > 0) {
+			for (const decl of t.functionDeclarations as Array<Record<string, unknown>>) {
+				functionDeclarations.push({
+					name: String(decl.name || `tool-${functionDeclarations.length}`).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64),
+					description: String(decl.description || ""),
+					parameters: normalizeClaudeToolSchema(decl.parameters || decl.parametersJsonSchema || decl.input_schema),
+				});
+			}
+			continue;
+		}
+
+		// Handle function/custom style tools
+		const funcDef = (t.function || t.custom || t) as Record<string, unknown>;
+		if (funcDef.name || funcDef.parameters) {
+			functionDeclarations.push({
+				name: String(funcDef.name || `tool-${functionDeclarations.length}`).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64),
+				description: String(funcDef.description || ""),
+				parameters: normalizeClaudeToolSchema(funcDef.parameters),
+			});
+			continue;
+		}
+
+		passthroughTools.push(tool);
+	}
+
+	const finalTools: unknown[] = [];
+	if (functionDeclarations.length > 0) {
+		finalTools.push({ functionDeclarations });
+	}
+	payload.tools = finalTools.concat(passthroughTools);
+
+	// Set VALIDATED mode for Claude
+	if (!payload.toolConfig) payload.toolConfig = {};
+	const tc = payload.toolConfig;
+	if (!tc.functionCallingConfig) tc.functionCallingConfig = {};
+	(tc.functionCallingConfig as Record<string, unknown>).mode = "VALIDATED";
+
+	// Inject tool hardening instruction
+	const existing = payload.systemInstruction;
+	if (typeof existing === "string" && existing.length > 0) {
+		payload.systemInstruction = `${existing as string}\n\n${CLAUDE_TOOL_HARDENING}`;
+	} else if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+		const sys = existing as ContentBlock;
+		if (Array.isArray(sys.parts) && sys.parts.length > 0) {
+			const lastPart = sys.parts[sys.parts.length - 1];
+			if (lastPart && typeof lastPart.text === "string") {
+				lastPart.text = `${lastPart.text}\n\n${CLAUDE_TOOL_HARDENING}`;
+			} else {
+				sys.parts.push({ text: CLAUDE_TOOL_HARDENING });
+			}
+		} else {
+			sys.parts = [{ text: CLAUDE_TOOL_HARDENING }];
+		}
+		payload.systemInstruction = sys;
+	}
+}
+
+// ------------------------------------------------------------------------
+// Phase 7b: Thought signature injection
+// ------------------------------------------------------------------------
+
+const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
+
+/** Thought signature cache — populated by after_provider_response handler, consumed here. */
+const thoughtSignatureCache = new Map<string, string>();
+
+function getCachedSignature(sessionModelKey: string): string | undefined {
+	return thoughtSignatureCache.get(sessionModelKey);
+}
+
+function cacheThoughtSignature(sessionModelKey: string, signature: string): void {
+	thoughtSignatureCache.set(sessionModelKey, signature);
+}
+
+function injectThoughtSignatures(payload: AntigravityRequestPayload, modelId: string): void {
+	const cacheKey = `session-${modelId}`;
+	const cachedSig = getCachedSignature(cacheKey);
+
+	const processParts = (parts: ContentPart[] | undefined): ContentPart[] | undefined => {
+		if (!parts) return undefined;
+
+		let foundFirstFunctionCall = false;
+		return parts.map((part) => {
+			if (!part || typeof part !== "object") return part;
+
+			// Handle function calls — first one gets the signature
+			if (part.functionCall && !foundFirstFunctionCall) {
+				foundFirstFunctionCall = true;
+				if (!part.thoughtSignature && !part.thought_signature) {
+					if (cachedSig) {
+						return { ...part, thoughtSignature: cachedSig, thought_signature: cachedSig };
+					}
+					return { ...part, thoughtSignature: SKIP_THOUGHT_SIGNATURE, thought_signature: SKIP_THOUGHT_SIGNATURE };
+				}
+			}
+
+			// Strip signatures from parallel function calls
+			if (part.functionCall && foundFirstFunctionCall) {
+				const p = { ...part };
+				delete p.thoughtSignature;
+				delete p.thought_signature;
+				return p;
+			}
+
+			// Handle thinking parts — ensure they have a signature
+			if (part.thought === true || part.type === "thinking" || part.type === "reasoning") {
+				if (!part.thoughtSignature && !part.thought_signature && !(part as Record<string, unknown>).signature) {
+					return { ...part, thoughtSignature: SKIP_THOUGHT_SIGNATURE };
+				}
+			}
+
+			return part;
+		});
+	};
+
+	// Process contents
+	if (Array.isArray(payload.contents)) {
+		for (const block of payload.contents) {
+			if (block && typeof block === "object" && (block.role === "model" || block.role === "assistant")) {
+				block.parts = processParts(block.parts) ?? block.parts;
+			}
+		}
+	}
+
+	// Process messages
+	if (Array.isArray(payload.messages)) {
+		for (const msg of payload.messages) {
+			if (msg && typeof msg === "object" && msg.role === "assistant") {
+				msg.content = processParts(msg.content) ?? msg.content;
+			}
+		}
+	}
+}
+
+// ------------------------------------------------------------------------
+// Combined request transformer
+// ------------------------------------------------------------------------
+
+function transformAntigravityRequest(
+	payload: unknown,
+	modelId: string | undefined,
+	provider: string | undefined,
+): unknown {
+	if (!isAntigravityProvider(provider)) return payload;
+
+	let transformed = sanitizeAntigravityPayload(payload, modelId);
+
+	if (isClaudeModel(modelId)) {
+		const p = transformed as AntigravityRequestPayload;
+		normalizeClaudeTools(p);
+		if (isClaudeThinkingModel(modelId)) {
+			injectThoughtSignatures(p, modelId!);
+		}
+	}
+
+	return transformed;
+}
+
+// ==========================================================================
+// Response transformation (Phase 7b+7d)
+// ==========================================================================
+
+function extractThoughtSignatures(responseData: unknown, modelId: string): void {
+	if (!responseData || typeof responseData !== "object") return;
+	const cacheKey = `session-${modelId}`;
+
+	const data = responseData as Record<string, unknown>;
+
+	// Extract from Gemini format: candidates[].content.parts[]
+	const candidates = data.candidates;
+	if (Array.isArray(candidates)) {
+		for (const candidate of candidates) {
+			if (!candidate || typeof candidate !== "object") continue;
+			const content = (candidate as Record<string, unknown>).content;
+			if (!content || typeof content !== "object") continue;
+			const parts = (content as Record<string, unknown>).parts;
+			if (!Array.isArray(parts)) continue;
+
+			let lastThinkingSig: string | undefined;
+			for (const part of parts) {
+				if (!part || typeof part !== "object") continue;
+				const p = part as Record<string, unknown>;
+				if (p.thought === true || p.type === "thinking" || p.type === "reasoning") {
+					const sig = (typeof p.thoughtSignature === "string" ? p.thoughtSignature :
+						typeof p.thought_signature === "string" ? p.thought_signature :
+						typeof p.signature === "string" ? p.signature : undefined) as string | undefined;
+					if (sig && sig !== "skip_thought_signature_validator" && sig.length >= 50) {
+						lastThinkingSig = sig;
+					}
+				}
+			}
+			if (lastThinkingSig) {
+				cacheThoughtSignature(cacheKey, lastThinkingSig);
+			}
+		}
+	}
+
+	// Extract from Claude/Anthropic format: content[] with type=thinking and signature
+	const respContent = data.content;
+	if (Array.isArray(respContent)) {
+		for (const block of respContent) {
+			if (!block || typeof block !== "object") continue;
+			const b = block as Record<string, unknown>;
+			if (b.type === "thinking" || b.type === "reasoning" || b.type === "redacted_thinking") {
+				const sig = typeof b.signature === "string" ? b.signature : undefined;
+				if (sig && sig !== "skip_thought_signature_validator" && sig.length >= 50) {
+					cacheThoughtSignature(cacheKey, sig);
+				}
+			}
+		}
+	}
+}
+
+function cleanAntigravityResponse(payload: unknown): unknown {
+	if (!payload || typeof payload !== "object") return payload;
+
+	let cleaned: Record<string, unknown>;
+	try {
+		cleaned = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+	} catch {
+		return payload;
+	}
+
+	const stripFromParts = (parts: unknown[] | undefined): void => {
+		if (!Array.isArray(parts)) return;
+		for (const part of parts) {
+			if (!part || typeof part !== "object") continue;
+			const p = part as Record<string, unknown>;
+			if (p.thoughtSignature === "skip_thought_signature_validator"
+				|| p.thought_signature === "skip_thought_signature_validator") {
+				delete p.thoughtSignature;
+				delete p.thought_signature;
+			}
+			if (p.type === "thinking" || p.type === "reasoning") {
+				delete p.signature;
+			}
+		}
+	};
+
+	const candidates = cleaned.candidates;
+	if (Array.isArray(candidates)) {
+		for (const candidate of candidates) {
+			if (candidate && typeof candidate === "object") {
+				const c = candidate as Record<string, unknown>;
+				if (c.content && typeof c.content === "object") {
+					const content = c.content as Record<string, unknown>;
+					stripFromParts(content.parts as unknown[]);
+				}
+			}
+		}
+	}
+
+	const content = cleaned.content;
+	if (Array.isArray(content)) {
+		stripFromParts(content as unknown[]);
+	}
+
+	return cleaned;
+}
+
+function transformAntigravityResponse(
+	payload: unknown,
+	modelId: string | undefined,
+	provider: string | undefined,
+): unknown {
+	if (!isAntigravityProvider(provider)) return payload;
+
+	extractThoughtSignatures(payload, modelId ?? "unknown");
+
+	return cleanAntigravityResponse(payload);
+}
+
+
 async function showSubscriptionActions(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -5908,6 +6359,30 @@ export default function multiSub(pi: ExtensionAPI) {
 					);
 				}
 			}
+		}
+	});
+
+	// Phase 7: Request/response transformation for antigravity providers
+	pi.on("before_provider_request", async (event, ctx) => {
+		const provider = ctx.model?.provider;
+		const modelId = ctx.model?.id;
+		if (!isAntigravityProvider(provider)) return;
+		try {
+			const transformed = transformAntigravityRequest(event.payload, modelId, provider);
+			if (transformed !== event.payload) {
+				return transformed;
+			}
+		} catch {
+			/* transformation failure should not block the request */
+		}
+	});
+
+	// Phase 7: Log antigravity API errors for debugging
+	pi.on("after_provider_response", async (event, ctx) => {
+		const provider = ctx.model?.provider;
+		if (!isAntigravityProvider(provider)) return;
+		if (event.status >= 400) {
+			console.error(`[multi-pass] antigravity request failed: status=${event.status} provider=${provider} model=${ctx.model?.id ?? "?"} headers=${JSON.stringify(event.headers)}`);
 		}
 	});
 
