@@ -32,6 +32,7 @@
  *   - google-antigravity (Antigravity)
  */
 
+import { exec } from "child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import type {
@@ -71,9 +72,12 @@ import {
 import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
 import {
 	Container,
+	Input,
 	Key,
 	SelectList,
+	Spacer,
 	Text,
+	getKeybindings,
 	matchesKey,
 	type SelectItem,
 } from "@mariozechner/pi-tui";
@@ -2957,6 +2961,219 @@ async function removeSubscriptionEntry(
 	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
 }
 
+// ==========================================================================
+// OAuth login flow
+// ==========================================================================
+
+async function performOAuthLogin(
+	ctx: ExtensionCommandContext,
+	providerId: string,
+	providerName: string,
+	usesCallbackServer: boolean,
+): Promise<boolean> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify(
+			`Use /login to authenticate ${providerName}. OAuth login requires interactive mode.`,
+			"warning",
+		);
+		return false;
+	}
+
+	const result = await ctx.ui.custom<boolean>(
+		(tui, theme, _kb, done) => {
+			const container = new Container();
+			const contentArea = new Container();
+			const inputComponent = new Input();
+			const abortController = new AbortController();
+
+			// Track if input is currently active (waiting for user)
+			let inputActive = false;
+
+			// Title
+			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+			container.addChild(new Text(theme.fg("accent", theme.bold(`Login to ${providerName}`))));
+
+			// Progress text
+			container.addChild(new Spacer(1));
+			const progressText = new Text(theme.fg("dim", "Starting login..."));
+			container.addChild(progressText);
+
+			// Content area
+			container.addChild(contentArea);
+
+			// Input (added to content area dynamically when needed)
+			inputComponent.onSubmit = () => {
+				if (inputActive) {
+					const value = inputComponent.getValue();
+					resolveInput(value);
+				}
+			};
+
+			// Key hints footer
+			container.addChild(new Spacer(1));
+			container.addChild(new Text(
+				theme.fg("dim", [keyHint("tui.select.cancel", "to cancel")].join(" • ")),
+			));
+			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+			// Input resolver management
+			let resolveInput: (value: string) => void = () => {};
+			let rejectInput: (error: Error) => void = () => {};
+
+			function promptForInput(promptMessage: string, placeholder?: string): Promise<string> {
+				// Remove any existing input from content area
+				contentArea.clear();
+				contentArea.addChild(new Spacer(1));
+				contentArea.addChild(new Text(theme.fg("text", promptMessage)));
+				if (placeholder) {
+					contentArea.addChild(new Text(theme.fg("dim", `e.g., ${placeholder}`)));
+				}
+				inputComponent.setValue("");
+				contentArea.addChild(inputComponent);
+				contentArea.addChild(new Text(
+					theme.fg("dim", `(${keyHint("tui.select.confirm", "to submit")})`),
+				));
+				inputActive = true;
+				tui.requestRender();
+
+				return new Promise((resolve, reject) => {
+					resolveInput = (value: string) => {
+						inputActive = false;
+						resolve(value);
+					};
+					rejectInput = reject;
+				});
+			}
+
+			function showUrl(url: string, instructions?: string): void {
+				contentArea.clear();
+				contentArea.addChild(new Spacer(1));
+				// Hyperlink for click-to-open
+				const linkedUrl = `\x1b]8;;${url}\x07${url}\x1b]8;;\x07`;
+				contentArea.addChild(new Text(theme.fg("accent", linkedUrl)));
+				const clickHint = process.platform === "darwin" ? "Cmd+click to open" : "Ctrl+click to open";
+				contentArea.addChild(new Text(theme.fg("dim", clickHint)));
+
+				if (instructions) {
+					contentArea.addChild(new Spacer(1));
+					contentArea.addChild(new Text(theme.fg("warning", instructions)));
+				}
+
+				// Open browser
+				const openCmd =
+					process.platform === "darwin" ? "open"
+					: process.platform === "win32" ? "start"
+					: "xdg-open";
+				exec(`${openCmd} "${url.replace(/"/g, "\\\"")}"`);
+
+				tui.requestRender();
+			}
+
+			function showProgress(message: string): void {
+				contentArea.addChild(new Spacer(1));
+				contentArea.addChild(new Text(theme.fg("dim", message)));
+				tui.requestRender();
+			}
+
+			// Start the login flow (async, callbacks update UI)
+			ctx.modelRegistry.authStorage.login(providerId, {
+				onAuth: (info: { url: string; instructions?: string }) => {
+					showUrl(info.url, info.instructions);
+					if (usesCallbackServer) {
+						// Show manual code input as race with callback server
+						contentArea.addChild(new Spacer(1));
+						contentArea.addChild(new Text(
+							theme.fg("dim", "Paste redirect URL below, or complete login in browser:"),
+						));
+						inputComponent.setValue("");
+						contentArea.addChild(inputComponent);
+						inputActive = true;
+						tui.requestRender();
+					} else if (providerId.startsWith("github-copilot")) {
+						contentArea.addChild(new Spacer(1));
+						contentArea.addChild(new Text(
+							theme.fg("dim", "Waiting for browser authentication..."),
+						));
+						tui.requestRender();
+					}
+				},
+
+				onPrompt: async (prompt: { message: string; placeholder?: string }) => {
+					return promptForInput(prompt.message, prompt.placeholder);
+				},
+
+				onProgress: (message: string) => {
+					showProgress(message);
+				},
+
+				onSelect: async (selectPrompt: {
+					message: string;
+					options: Array<{ id: string; label: string }>;
+				}) => {
+					// Show selector within content area (bounce back to ctx for proper rendering)
+					const selected = await ctx.ui.select(
+						selectPrompt.message,
+						selectPrompt.options.map((opt) => opt.label),
+					);
+					if (!selected) return undefined;
+					const index = selectPrompt.options.findIndex((opt) => opt.label === selected);
+					return index >= 0 ? selectPrompt.options[index]?.id : undefined;
+				},
+
+				onManualCodeInput: async () => {
+					// The input is already set up by onAuth for callback server providers.
+					// Return a promise that resolves when the user submits or rejects on cancel.
+					return new Promise((resolve, reject) => {
+						resolveInput = resolve;
+						rejectInput = reject;
+					});
+				},
+
+				signal: abortController.signal,
+			}).then(() => {
+				ctx.modelRegistry.refresh();
+				done(true);
+			}).catch((error: unknown) => {
+				if (abortController.signal.aborted) {
+					done(false);
+					return;
+				}
+				const message = error instanceof Error ? error.message : String(error);
+				if (message !== "Login cancelled") {
+					ctx.ui.notify(`Login failed: ${message}`, "error");
+				}
+				done(false);
+			});
+
+			return {
+				render(width: number) {
+					return container.render(width);
+				},
+				invalidate() {
+					container.invalidate();
+				},
+				handleInput(data: string) {
+					const kb = getKeybindings();
+					if (kb.matches(data, "tui.select.cancel")) {
+						abortController.abort();
+						if (inputActive) {
+							rejectInput(new Error("Login cancelled"));
+							inputActive = false;
+						}
+						done(false);
+						return;
+					}
+					inputComponent.handleInput(data);
+					tui.requestRender();
+				},
+			};
+		},
+		{ overlay: true },
+	);
+
+	return result ?? false;
+}
+
 async function showSubscriptionActions(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -2987,7 +3204,7 @@ async function showSubscriptionActions(
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		hasAuth
 			? { value: "logout", label: "logout", description: "Log out this subscription" }
-			: { value: "login", label: "login", description: "Show login instructions" },
+			: { value: "login", label: "login", description: "Authenticate this subscription" },
 		{ value: "remove", label: "remove", description: "Remove this subscription" },
 	];
 
@@ -3004,10 +3221,9 @@ async function showSubscriptionActions(
 		return renameSubscriptionLabel(ctx, config, entry);
 	}
 	if (action === "login") {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		const template = PROVIDER_TEMPLATES[entry.provider];
+		const usesCallbackServer = template?.usesCallbackServer ?? template?.builtinOAuth.usesCallbackServer ?? false;
+		await performOAuthLogin(ctx, name, subDisplayName(entry), usesCallbackServer);
 		return;
 	}
 	if (action === "logout") {
@@ -3108,10 +3324,9 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	);
 
 	if (loginNow) {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		const template = PROVIDER_TEMPLATES[entry.provider];
+		const usesCallbackServer = template?.usesCallbackServer ?? template?.builtinOAuth.usesCallbackServer ?? false;
+		await performOAuthLogin(ctx, subProviderName(entry), subDisplayName(entry), usesCallbackServer);
 	} else {
 		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
 	}
@@ -3188,10 +3403,9 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.ui.notify(
-		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-		"info",
-	);
+	const template = PROVIDER_TEMPLATES[entry.provider];
+	const usesCallbackServer = template?.usesCallbackServer ?? template?.builtinOAuth.usesCallbackServer ?? false;
+	await performOAuthLogin(ctx, subProviderName(entry), subDisplayName(entry), usesCallbackServer);
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
