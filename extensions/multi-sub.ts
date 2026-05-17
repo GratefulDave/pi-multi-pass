@@ -87,7 +87,7 @@ import {
 // ==========================================================================
 
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
-type GeminiCredentials = OAuthCredentials & { projectId?: string };
+type GeminiCredentials = OAuthCredentials & { projectId?: string; managedProjectId?: string };
 
 interface ProviderTemplate {
 	displayName: string;
@@ -95,6 +95,7 @@ interface ProviderTemplate {
 	usesCallbackServer?: boolean;
 	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
 	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+	buildProviderHeaders?(): Record<string, string>;
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
@@ -212,6 +213,12 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 				},
 			};
 		},
+		buildProviderHeaders(): Record<string, string> {
+			return {
+				"User-Agent": "google-api-nodejs-client/9.15.1",
+				"X-Goog-Api-Client": "gl-node/22.17.0",
+			};
+		},
 	},
 
 	"google-antigravity": {
@@ -223,11 +230,25 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 				name: `Antigravity #${index}`,
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
+					const credentials = await loginAntigravity(
 						callbacks.onAuth,
 						callbacks.onProgress,
 						callbacks.onManualCodeInput,
 					);
+					// Discover and cache managed project ID
+					try {
+						const creds = credentials as GeminiCredentials;
+						const managedProjectId = await loadAntigravityProject(
+							creds.access,
+							creds.projectId,
+						);
+						if (managedProjectId) {
+							(credentials as Record<string, unknown>).managedProjectId = managedProjectId;
+						}
+					} catch {
+						/* non-fatal: proceed without managed project */
+					}
+					return credentials;
 				},
 				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 					const creds = credentials as GeminiCredentials;
@@ -236,14 +257,89 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 				},
 				getApiKey(credentials: OAuthCredentials): string {
 					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
+					return JSON.stringify({
+						token: creds.access,
+						projectId: creds.projectId,
+						managedProjectId: creds.managedProjectId,
+					});
 				},
+			};
+		},
+		buildProviderHeaders(): Record<string, string> {
+			return getAntigravityProviderHeaders();
+		},
+		buildModifyModels(providerName: string) {
+			const sandboxUrl = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+			return (models: Model<Api>[]): Model<Api>[] => {
+				return models.map((m) =>
+					m.provider === providerName ? { ...m, baseUrl: sandboxUrl } : m,
+				);
 			};
 		},
 	},
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
+
+// ==========================================================================
+// Session fingerprinting for anti-ban (Antigravity)
+// ==========================================================================
+
+interface SessionFingerprint {
+	deviceId: string;
+	userAgent: string;
+	apiClient: string;
+	clientMetadata: string;
+}
+
+let _sessionFingerprint: SessionFingerprint | null = null;
+
+function getSessionFingerprint(): SessionFingerprint {
+	if (!_sessionFingerprint) {
+		const platform = process.platform === "win32" ? "windows" : "darwin";
+		const arch = process.arch === "arm64" ? "arm64" : "amd64";
+		const osVersions: Record<string, string[]> = {
+			darwin: ["10.15.7", "11.6.8", "12.6.3", "13.5.2", "14.2.1", "14.5"],
+			windows: ["10.0.19041", "10.0.22000", "10.0.22621", "10.0.22631"],
+		};
+		const versions = osVersions[platform] ?? osVersions.darwin;
+		const osVersion = versions[Math.floor(Math.random() * versions.length)];
+		const userAgent = platform === "windows"
+			? `Mozilla/5.0 (Windows NT ${osVersion.split(".")[2] || "22621"}; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36`
+			: `Mozilla/5.0 (Macintosh; Intel Mac OS X ${osVersion.replace(/\./g, "_")}) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36`;
+
+		const apiClients = [
+			"google-cloud-sdk vscode_cloudshelleditor/0.1",
+			"google-cloud-sdk vscode/1.86.0",
+			"google-cloud-sdk vscode/1.96.0",
+		];
+
+		_sessionFingerprint = {
+			deviceId: `${platform}-${arch}-${osVersion}-${Date.now()}`,
+			userAgent,
+			apiClient: apiClients[Math.floor(Math.random() * apiClients.length)],
+			clientMetadata: JSON.stringify({
+				ideType: "ANTIGRAVITY",
+				platform: platform === "windows" ? "WINDOWS" : "MACOS",
+				pluginType: "GEMINI",
+			}),
+		};
+	}
+	return _sessionFingerprint;
+}
+
+function getAntigravityProviderHeaders(): Record<string, string> {
+	const fp = getSessionFingerprint();
+	return {
+		"User-Agent": fp.userAgent,
+		"X-Goog-Api-Client": fp.apiClient,
+		"Client-Metadata": fp.clientMetadata,
+	};
+}
+
+function resetSessionFingerprint(): void {
+	_sessionFingerprint = null;
+}
 
 // ==========================================================================
 // Built-in quota checking
@@ -259,15 +355,32 @@ const GOOGLE_GEMINI_HEADERS = {
 	"User-Agent": "google-api-nodejs-client/9.15.1",
 	"X-Goog-Api-Client": "gl-node/22.17.0",
 };
-const GOOGLE_ANTIGRAVITY_HEADERS = {
-	"User-Agent": "antigravity/1.11.9 windows/amd64",
-	"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-	"Client-Metadata": JSON.stringify({
-		ideType: "IDE_UNSPECIFIED",
-		platform: "PLATFORM_UNSPECIFIED",
-		pluginType: "GEMINI",
-	}),
-};
+
+// Browser-matching User-Agents for Antigravity (matches real desktop app)
+const ANTIGRAVITY_USER_AGENTS = [
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
+];
+const ANTIGRAVITY_API_CLIENTS = [
+	"google-cloud-sdk vscode_cloudshelleditor/0.1",
+	"google-cloud-sdk vscode/1.86.0",
+	"google-cloud-sdk vscode/1.96.0",
+];
+
+function getAntigravityHeaders(): Record<string, string> {
+	return {
+		"User-Agent": ANTIGRAVITY_USER_AGENTS[Math.floor(Math.random() * ANTIGRAVITY_USER_AGENTS.length)],
+		"X-Goog-Api-Client": ANTIGRAVITY_API_CLIENTS[Math.floor(Math.random() * ANTIGRAVITY_API_CLIENTS.length)],
+		"Client-Metadata": JSON.stringify({
+			ideType: "ANTIGRAVITY",
+			platform: process.platform === "win32" ? "WINDOWS" : "MACOS",
+			pluginType: "GEMINI",
+		}),
+	};
+}
+
+/** @deprecated Use getAntigravityHeaders() instead */
+const GOOGLE_ANTIGRAVITY_HEADERS = getAntigravityHeaders();
 const GOOGLE_ANTIGRAVITY_HIDDEN_MODELS = new Set(["tab_flash_lite_preview"]);
 const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
@@ -1026,7 +1139,7 @@ async function fetchGoogleAntigravityQuotaSnapshot(
 				Authorization: `Bearer ${accessToken}`,
 				Accept: "application/json",
 				"Content-Type": "application/json",
-				...GOOGLE_ANTIGRAVITY_HEADERS,
+				...getAntigravityHeaders(),
 			},
 			body: JSON.stringify(projectId ? { project: projectId } : {}),
 			signal,
@@ -1412,6 +1525,53 @@ async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
 		preferredProviderName = selected.account.providerName;
 		await showQuotaDetails(ctx, selected);
 	}
+}
+
+// ==========================================================================
+// Antigravity project discovery (managed project caching)
+// ==========================================================================
+
+async function loadAntigravityProject(
+	accessToken: string,
+	projectId?: string,
+): Promise<string | undefined> {
+	const endpoints = [
+		"https://cloudcode-pa.googleapis.com",
+		"https://daily-cloudcode-pa.sandbox.googleapis.com",
+	];
+	const metadata = {
+		ideType: "ANTIGRAVITY",
+		platform: process.platform === "win32" ? "WINDOWS" : "MACOS",
+		pluginType: "GEMINI",
+	};
+	const body: Record<string, unknown> = { metadata };
+	if (projectId) body.cloudaicompanionProject = projectId;
+
+	for (const endpoint of endpoints) {
+		try {
+			const response = await fetch(`${endpoint}/v1internal:loadCodeAssist`, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${accessToken}`,
+					"User-Agent": "google-api-nodejs-client/9.15.1",
+					"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+					"Client-Metadata": JSON.stringify(metadata),
+				},
+				body: JSON.stringify(body),
+			});
+			if (!response.ok) continue;
+			const data = (await response.json()) as Record<string, unknown>;
+			if (typeof data.cloudaicompanionProject === "string") return data.cloudaicompanionProject;
+			if (data.cloudaicompanionProject && typeof data.cloudaicompanionProject === "object") {
+				const proj = data.cloudaicompanionProject as Record<string, unknown>;
+				if (typeof proj.id === "string") return proj.id;
+			}
+		} catch {
+			/* try next endpoint */
+		}
+	}
+	return undefined;
 }
 
 // ==========================================================================
@@ -1914,6 +2074,10 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 		api: builtinModels[0]?.api,
 		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
+		headers: {
+			"x-goog-user-project": "",
+			...(template.buildProviderHeaders?.() ?? {}),
+		},
 	});
 }
 
@@ -5653,6 +5817,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
+		resetSessionFingerprint();
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
